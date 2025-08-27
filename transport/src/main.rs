@@ -1,9 +1,14 @@
+use common::EncryptedStream;
 use negotiation::negotiate_protocol;
-use std::{env, net::SocketAddr};
+use security::negotiate_security_protocol;
+use std::{env, net::SocketAddr, sync::Arc};
 use tokio::{
-    io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
+
+use std::collections::HashMap;
 
 const SERVER_ADDR: &str = "127.0.0.1:8080";
 
@@ -52,25 +57,40 @@ async fn run_client(addr: &str) {
 
     let (reader, mut writer) = stream.into_split();
     let mut socket_reader = BufReader::new(reader);
-    let mut socket_line = String::new();
 
-    negotiate_protocol(&mut socket_reader, &mut writer, true).await;
+    let transport = negotiate_security_protocol(
+        &mut socket_reader,
+        &mut writer,
+        true,
+        &supported_protocols(),
+    )
+    .await;
+
+    let reader = socket_reader.into_inner();
+
+    let mut stream = EncryptedStream {
+        noise: transport,
+        reader,
+        writer,
+    };
+
+    negotiate_protocol(&mut stream, true, &supported_protocols()).await;
+
+    let stream_arc = Arc::new(Mutex::new(stream));
+    let stream_other = Arc::clone(&stream_arc);
 
     // read from the socket
     let socket_task = tokio::spawn(async move {
         loop {
-            socket_line.clear();
-            match socket_reader.read_line(&mut socket_line).await {
-                Ok(0) => {
+            let mut lock = stream_arc.lock().await;
+            let response = lock.recv().await.unwrap();
+            match response.len() {
+                0 => {
                     println!("Server closed connection");
                     break;
                 }
-                Ok(_) => {
-                    println!("Server: {}", socket_line.trim());
-                }
-                Err(e) => {
-                    eprintln!("Error reading from server: {e}");
-                    break;
+                _ => {
+                    println!("Server: {}", String::from_utf8_lossy(&response).trim());
                 }
             }
         }
@@ -90,7 +110,8 @@ async fn run_client(addr: &str) {
 
             input = input.trim().to_string();
             let msg = format!("PING {input}");
-            if let Err(e) = writer.write_all(format!("{msg}\n").as_bytes()).await {
+            let mut lock = stream_other.lock().await;
+            if let Err(e) = lock.send(format!("{msg}\n").as_bytes()).await {
                 eprintln!("Error writing to server: {e}");
                 break;
             }
@@ -102,37 +123,58 @@ async fn run_client(addr: &str) {
 
 async fn handle_connection(socket: TcpStream, addr: SocketAddr) {
     let (reader, mut writer) = socket.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut stream_reader = BufReader::new(reader);
 
-    negotiate_protocol(&mut reader, &mut writer, false).await;
+    let transport = negotiate_security_protocol(
+        &mut stream_reader,
+        &mut writer,
+        false,
+        &supported_protocols(),
+    )
+    .await;
+
+    let reader = stream_reader.into_inner();
+
+    let mut stream = EncryptedStream {
+        noise: transport,
+        reader,
+        writer,
+    };
+
+    negotiate_protocol(&mut stream, false, &supported_protocols()).await;
 
     loop {
-        line.clear();
-        let _n = match reader.read_line(&mut line).await {
-            Ok(0) => {
-                println!("Client {addr} disconnected");
+        let response = stream.recv().await.unwrap();
+        match response.len() {
+            0 => {
+                println!("Server closed connection");
                 break;
             }
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("Error reading from {addr}: {e}");
-                break;
+            _ => {
+                println!("Server: {}", String::from_utf8_lossy(&response).trim());
             }
-        };
+        }
 
+        let line = String::from_utf8_lossy(&response);
         let msg = line.trim();
         println!("Received from {addr}: {}", msg);
 
         if msg.starts_with("PING") {
             let repsonse = msg.replace("PING", "PONG");
-            if let Err(e) = writer.write_all(format!("{repsonse}\n").as_bytes()).await {
+            if let Err(e) = stream.send(format!("{repsonse}\n").as_bytes()).await {
                 eprintln!("Error writing to {addr}: {e}");
                 break;
             }
         }
         if msg == "/multistream/1.0.0" {
-            negotiate_protocol(&mut reader, &mut writer, true).await;
+            negotiate_protocol(&mut stream, true, &supported_protocols()).await;
         }
     }
+}
+
+fn supported_protocols() -> HashMap<&'static str, Vec<&'static str>> {
+    HashMap::from([
+        ("security", vec!["/noise/xx"]),
+        ("protocol", vec!["/ping/1.0.0"]),
+    ])
 }

@@ -8,3 +8,6 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 anyhow = "1"
 negotiation = { path = "../negotiation/" }
+security = { path = "../security" }
+snow = "0.10"
+common = { path = "../common"}
