@@ -175,11 +175,6 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) {
                 break;
             }
         }
-
-        if msg == "/multistream/1.0.0" {
-            println!("[server] Detected multistream protocol re-negotiation with {addr}");
-            negotiate_protocol(&mut stream, true, &supported_protocols()).await;
-        }
     }
 }
 

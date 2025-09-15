@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-snow = "0.10"
+snow = "0.10"  # for noise xx handshake
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 common = { path = "../common" }
+x25519-dalek = "2.0.1"
+chacha20poly1305 = "0.10.1"
+blake3 = "1.8.2"
+rand = "0.9.2"
