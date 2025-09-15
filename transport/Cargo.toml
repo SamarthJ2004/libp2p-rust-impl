@@ -11,3 +11,4 @@ negotiation = { path = "../negotiation/" }
 security = { path = "../security" }
 snow = "0.10"
 common = { path = "../common"}
+muxer = { path = "../muxer" }

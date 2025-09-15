@@ -384,6 +384,10 @@ dependencies = [
 [[package]]
 name = "muxer"
 version = "0.1.0"
+dependencies = [
+ "common",
+ "tokio",
+]
 
 [[package]]
 name = "negotiation"
@@ -751,6 +755,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "common",
+ "muxer",
  "negotiation",
  "security",
  "snow",

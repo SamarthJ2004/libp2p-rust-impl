@@ -1,4 +1,5 @@
 use common::EncryptedStream;
+use muxer::negotiate_multiplexing_protocol;
 use negotiation::negotiate_protocol;
 use security::negotiate_security_protocol;
 use std::{env, net::SocketAddr, sync::Arc};
@@ -75,6 +76,10 @@ async fn run_client(addr: &str) {
         writer: Mutex::new(writer),
     };
 
+    println!("[client] Starting multiplexing protocol negotiation...");
+    negotiate_multiplexing_protocol(&mut stream, true, &supported_protocols()).await;
+    println!("[client] Protocol negotiation complete");
+
     println!("[client] Starting protocol negotiation...");
     negotiate_protocol(&mut stream, true, &supported_protocols()).await;
     println!("[client] Protocol negotiation complete");
@@ -147,6 +152,10 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) {
         writer: Mutex::new(writer),
     };
 
+    println!("[server] Starting multiplexing protocol negotiation...");
+    negotiate_multiplexing_protocol(&mut stream, false, &supported_protocols()).await;
+    println!("[server] Protocol negotiation complete");
+
     println!("[server] Starting protocol negotiation with {addr}");
     negotiate_protocol(&mut stream, false, &supported_protocols()).await;
     println!("[server] Protocol negotiation complete with {addr}");
@@ -182,5 +191,6 @@ fn supported_protocols() -> HashMap<&'static str, Vec<&'static str>> {
     HashMap::from([
         ("security", vec!["/noise/xx"]),
         ("protocol", vec!["/ping/1.0.0"]),
+        ("multiplexing", vec!["/yamux", "/mplex"]),
     ])
 }
