@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use common::EncryptedStream;
-use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -79,108 +79,160 @@ impl Frame {
     }
 }
 
-pub async fn negotiate_multiplexing_protocol(
-    stream: &mut EncryptedStream,
-    is_initiator: bool,
-    supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
-) -> tokio::io::Result<String> {
-    if is_initiator {
-        println!("[negotiate_protocol] -> Sending /multistream/1.0.0");
-        let _ = stream.send(b"/multistream/1.0.0\n").await;
-    }
-
-    let response = stream.recv().await.unwrap();
-    let proto = String::from_utf8_lossy(&response);
-    println!(
-        "[negotiate_protocol] <- Received negotiation protocol: {}",
-        proto
-    );
-
-    if proto.trim() == "/multistream/1.0.0" {
-        if !is_initiator {
-            println!("[negotiate_protocol] -> Sending /multistream/1.0.0");
-            let _ = stream.send(b"/multistream/1.0.0\n").await;
-        }
-        println!("[negotiate_protocol] Entering subprotocol negotiation");
-        if let Some(transport) = negotiate(stream, is_initiator, &supported_protocols)
-            .await
-            .unwrap()
-        {
-            println!("[negotiate_protocol] ✅ Agreed on protocol: {transport}");
-            return Ok(transport);
-        } else {
-            eprintln!("[negotiate_protocol] ❌ Unimplemented protocol");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unsupported negotiation protocol: {}", proto),
-            ));
-        }
-    } else {
-        eprintln!(
-            "[negotiate_protocol] Unsupported negotiation protocol: {other}",
-            other = proto
-        );
-        std::process::exit(1);
-    }
+pub struct Muxer {
+    inner: Arc<EncryptedStream>,
+    next_stream_id: Mutex<u32>, // allocate ids (odd/even handled by caller)
+    streams: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>, // stream_id -> sender to per-stream handler
+    incoming_tx: mpsc::Sender<(u32, String, mpsc::Receiver<Bytes>)>, // reader -> app (for new incoming streams)
+    incoming_rx: Mutex<mpsc::Receiver<(u32, String, mpsc::Receiver<Bytes>)>>,
 }
 
-async fn negotiate(
-    stream: &mut EncryptedStream,
-    is_initiator: bool,
-    supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
-) -> tokio::io::Result<Option<String>> {
-    println!("[negotiate] Started negotiation, initiator={is_initiator}");
+impl Muxer {
+    /// Create the muxer. `initiator=true` => start ids at 1 (odd), else 2.
+    pub fn new(inner: Arc<EncryptedStream>, initiator: bool) -> Arc<Self> {
+        let start = if initiator { 1 } else { 2 };
+        let (tx, rx) = mpsc::channel(32);
+        Arc::new(Self {
+            inner,
+            next_stream_id: Mutex::new(start),
+            streams: Mutex::new(HashMap::new()),
+            incoming_tx: tx,
+            incoming_rx: Mutex::new(rx),
+        })
+    }
 
-    if is_initiator {
-        let mut input = String::new();
-        let mut stdin_reader = BufReader::new(tokio::io::stdin());
-        println!(
-            "[negotiate][initiator] Available protocols: {:?}",
-            supported_protocols.get("multiplexing")
-        );
+    /// Spawn the background reader. Call this once.
+    pub fn start_reader(self: &Arc<Self>) {
+        let s = Arc::clone(self);
+        tokio::spawn(async move {
+            s.reader_loop().await;
+        });
+    }
 
-        stdin_reader.read_line(&mut input).await?;
-        let proto = input.trim();
-        println!("[negotiate][initiator] Proposing protocol: {proto}");
+    /// Reader loop: pulls frames from EncryptedStream, decodes, routes them.
+    async fn reader_loop(self: Arc<Self>) {
+        loop {
+            let raw = match self.inner.recv().await {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("[muxer] underlying recv error: {:?}", e);
+                    break;
+                }
+            };
 
-        stream.send(format!("{proto}\n").as_bytes()).await?;
-
-        let response = stream.recv().await.unwrap();
-        let line = String::from_utf8_lossy(&response);
-        println!("[negotiate][initiator] <- Received response: {}", line);
-
-        if line.trim() == proto {
-            println!("[negotiate][initiator] ✅ Negotiated protocol: {proto}");
-            Ok(Some(proto.to_string()))
-        } else {
-            println!(
-                "[negotiate][initiator] ❌ Protocol rejected by responder: {}",
-                line.trim()
-            );
-            Ok(None)
-        }
-    } else {
-        println!("[negotiate][responder] Waiting for initiator proposal");
-        let response = stream.recv().await.unwrap();
-        let line = String::from_utf8_lossy(&response);
-        let proposal = line.trim();
-        println!("[negotiate][responder] <- Received proposal: {proposal}");
-
-        if let Some(p) = supported_protocols.get("multiplexing") {
-            if p.contains(&proposal) {
-                println!("[negotiate][responder] ✅ Accepting proposal: {proposal}");
-                stream.send(format!("{}\n", proposal).as_bytes()).await?;
-                Ok(Some(proposal.to_string()))
-            } else {
-                eprintln!(
-                    "[negotiate][responder] ❌ Unsupported proposal: {proposal}, replying 'na'"
-                );
-                stream.send(b"na\n").await?;
-                Ok(None)
+            match Frame::decode(&raw) {
+                Ok((frame, _consumed)) => {
+                    match frame.t {
+                        FrameType::Open => {
+                            // payload is protocol name
+                            let proto = String::from_utf8_lossy(&frame.payload).to_string();
+                            // create channel the handler will read from
+                            let (tx, rx) = mpsc::channel::<Bytes>(32);
+                            {
+                                let mut map = self.streams.lock().await;
+                                map.insert(frame.stream_id, tx);
+                            }
+                            // notify application of incoming stream
+                            let _ = self.incoming_tx.send((frame.stream_id, proto, rx)).await;
+                        }
+                        FrameType::Data => {
+                            let maybe = {
+                                let map = self.streams.lock().await;
+                                map.get(&frame.stream_id).cloned()
+                            };
+                            if let Some(tx) = maybe {
+                                // best-effort send
+                                let _ = tx.send(frame.payload).await;
+                            } else {
+                                println!("[muxer] data for unknown stream {}", frame.stream_id);
+                            }
+                        }
+                        FrameType::Close | FrameType::Reset => {
+                            // remove stream and close channel
+                            let maybe = {
+                                let mut map = self.streams.lock().await;
+                                map.remove(&frame.stream_id)
+                            };
+                            if maybe.is_some() {
+                                println!("[muxer] stream {} closed/removed", frame.stream_id);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[muxer] frame decode error: {:?}", e);
+                    // continue (you can decide to break/terminate connection)
+                }
             }
-        } else {
-            eprintln!("[negotiate][responder] ⚠️ No protocols found in supported_protocols");
-            Ok(None)
         }
+
+        println!("[muxer] reader exiting");
+    }
+
+    /// Open an outgoing stream with a protocol name.
+    /// Returns (stream_id, receiver) where `receiver` yields Bytes for Data frames from peer.
+    pub async fn open_stream(
+        self: &Arc<Self>,
+        protocol: &str,
+    ) -> Result<(u32, mpsc::Receiver<Bytes>), std::io::Error> {
+        // allocate id
+        let id = {
+            let mut lock = self.next_stream_id.lock().await;
+            let id = *lock;
+            *lock = id.wrapping_add(2);
+            id
+        };
+
+        // create per-stream rx/tx and register tx in map so incoming DATA gets routed
+        let (tx, rx) = mpsc::channel::<Bytes>(32);
+        {
+            let mut map = self.streams.lock().await;
+            map.insert(id, tx);
+        }
+
+        // send OPEN frame with protocol name as payload
+        let frame = Frame {
+            t: FrameType::Open,
+            stream_id: id,
+            payload: Bytes::from(protocol.to_string()),
+        };
+        let enc = frame.encode();
+        self.inner.send(&enc).await?;
+        Ok((id, rx))
+    }
+
+    /// Accept next incoming stream (server side). Returns (stream_id, protocol, receiver)
+    /// awaits until a remote opens a stream.
+    pub async fn accept_stream(&self) -> Option<(u32, String, mpsc::Receiver<Bytes>)> {
+        let mut rx = self.incoming_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Send application data on stream_id
+    pub async fn send_data(&self, stream_id: u32, data: &[u8]) -> Result<(), std::io::Error> {
+        let frame = Frame {
+            t: FrameType::Data,
+            stream_id,
+            payload: Bytes::copy_from_slice(data),
+        };
+        let enc = frame.encode();
+        self.inner.send(&enc).await?;
+        Ok(())
+    }
+
+    /// Close stream (notify remote and remove local state)
+    pub async fn close_stream(&self, stream_id: u32) -> Result<(), std::io::Error> {
+        {
+            let mut map = self.streams.lock().await;
+            map.remove(&stream_id);
+        }
+        let frame = Frame {
+            t: FrameType::Close,
+            stream_id,
+            payload: Bytes::new(),
+        };
+        let enc = frame.encode();
+        self.inner.send(&enc).await?;
+        Ok(())
     }
 }

@@ -1,11 +1,10 @@
 use common::EncryptedStream;
-use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub async fn negotiate_protocol(
     stream: &mut EncryptedStream,
     is_initiator: bool,
-    supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
+    supported_protocols: &Vec<&'static str>,
 ) -> tokio::io::Result<String> {
     if is_initiator {
         println!("[negotiate_protocol] -> Sending /multistream/1.0.0");
@@ -50,7 +49,7 @@ pub async fn negotiate_protocol(
 async fn negotiate(
     stream: &mut EncryptedStream,
     is_initiator: bool,
-    supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
+    supported_protocols: &Vec<&'static str>,
 ) -> tokio::io::Result<Option<String>> {
     println!("[negotiate] Started negotiation, initiator={is_initiator}");
 
@@ -59,7 +58,7 @@ async fn negotiate(
         let mut stdin_reader = BufReader::new(tokio::io::stdin());
         println!(
             "[negotiate][initiator] Available protocols: {:?}",
-            supported_protocols.get("protocol")
+            supported_protocols
         );
 
         stdin_reader.read_line(&mut input).await?;
@@ -89,20 +88,13 @@ async fn negotiate(
         let proposal = line.trim();
         println!("[negotiate][responder] <- Received proposal: {proposal}");
 
-        if let Some(p) = supported_protocols.get("protocol") {
-            if p.contains(&proposal) {
-                println!("[negotiate][responder] ✅ Accepting proposal: {proposal}");
-                stream.send(format!("{}\n", proposal).as_bytes()).await?;
-                Ok(Some(proposal.to_string()))
-            } else {
-                eprintln!(
-                    "[negotiate][responder] ❌ Unsupported proposal: {proposal}, replying 'na'"
-                );
-                stream.send(b"na\n").await?;
-                Ok(None)
-            }
+        if supported_protocols.contains(&proposal) {
+            println!("[negotiate][responder] ✅ Accepting proposal: {proposal}");
+            stream.send(format!("{}\n", proposal).as_bytes()).await?;
+            Ok(Some(proposal.to_string()))
         } else {
-            eprintln!("[negotiate][responder] ⚠️ No protocols found in supported_protocols");
+            eprintln!("[negotiate][responder] ❌ Unsupported proposal: {proposal}, replying 'na'");
+            stream.send(b"na\n").await?;
             Ok(None)
         }
     }

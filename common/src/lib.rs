@@ -31,8 +31,17 @@ impl EncryptedStream {
 
         println!("[send] Locking writer to send encrypted data");
         let mut lock = self.writer.lock().await;
-        println!("[send] Sending encrypted bytes: {:?}", &buf[..len]);
+        // len is a u16, so we can use `to_be_bytes()`
+        let len_bytes = (len as u16).to_be_bytes();
+
+        // First, send the length of the upcoming message
+        println!("[send] Sending message length: {len}");
+        lock.write_all(&len_bytes).await?;
+
+        // Then, send the encrypted message itself
+        println!("[send] Sending encrypted bytes");
         lock.write_all(&buf[..len]).await?;
+
         println!("[send] Successfully sent {len} bytes");
         Ok(())
     }
@@ -40,24 +49,32 @@ impl EncryptedStream {
     pub async fn recv(&self) -> tokio::io::Result<Vec<u8>> {
         println!("[recv] Waiting to read data from stream");
 
-        let mut msg = [0u8; 4096];
-        let n;
+        let mut len_buf = [0u8; 2];
+        {
+            println!("[recv] Locking reader to fetch message length");
+            let mut lock = self.reader.lock().await;
+            lock.read_exact(&mut len_buf).await?;
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        println!("[recv] Received message length: {len}");
+
+        let mut msg = vec![0u8; len];
         {
             println!("[recv] Locking reader to fetch incoming data");
             let mut lock = self.reader.lock().await;
-            n = lock.read(&mut msg).await?;
+            lock.read_exact(&mut msg).await?;
         }
-        println!("[recv] Read {n} bytes: {:?}", &msg[..n]);
+        println!("[recv] Read {len} bytes: {:?}", &msg[..len]);
 
-        let mut buf = [0u8; 4096];
+        let mut buf = vec![0u8; len];
         println!("[recv] Locking noise state for decryption");
         let mut lock = self.noise.lock().await;
-        let len = lock
-            .read_message(&msg[..n], &mut buf)
+        let decrypted_len = lock
+            .read_message(&msg, &mut buf)
             .map_err(|e| tokio::io::Error::new(tokio::io::ErrorKind::Other, e))?;
-        println!("[recv] Successfully decrypted {len} bytes");
+        println!("[recv] Successfully decrypted {decrypted_len} bytes");
 
-        Ok(buf[..len].to_vec())
+        Ok(buf[..decrypted_len].to_vec())
     }
 }
 
