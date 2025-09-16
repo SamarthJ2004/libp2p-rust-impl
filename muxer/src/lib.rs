@@ -1,12 +1,89 @@
+use bytes::{Bytes, BytesMut};
 use common::EncryptedStream;
 use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameType {
+    Open = 1,
+    Data = 2,
+    Close = 3,
+    Reset = 4,
+}
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub t: FrameType,
+    pub stream_id: u32,
+    pub payload: Bytes,
+}
+
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum FrameDecodeError {
+    #[error("buffer too short")]
+    TooShort,
+    #[error("unknown frame type {0}")]
+    UnknownType(u8),
+    #[error("declared payload too large: {0}")]
+    TooLarge(u32),
+    #[error("payload length mismatch: declared {declared}, actual {actual}")]
+    LengthMismatch { declared: usize, actual: usize },
+}
+
+impl Frame {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+
+        buf.extend_from_slice(&self.stream_id.to_le_bytes());
+        buf.extend_from_slice(&(self.t as u8).to_le_bytes());
+        buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+
+        buf.freeze()
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<(Frame, usize), FrameDecodeError> {
+        if buf.len() < 4 + 1 + 4 {
+            return Err(FrameDecodeError::TooShort);
+        }
+
+        let stream_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let t_raw = buf[4];
+        let len = u32::from_le_bytes(buf[5..9].try_into().unwrap()) as usize;
+
+        if buf.len() < 9 + len {
+            return Err(FrameDecodeError::LengthMismatch {
+                declared: len,
+                actual: buf.len() - 9,
+            });
+        }
+
+        let t = match t_raw {
+            1 => FrameType::Open,
+            2 => FrameType::Data,
+            3 => FrameType::Close,
+            4 => FrameType::Reset,
+            other => return Err(FrameDecodeError::UnknownType(other)),
+        };
+
+        let payload = Bytes::copy_from_slice(&buf[9..9 + len]);
+
+        Ok((
+            Frame {
+                t,
+                stream_id,
+                payload,
+            },
+            9 + len,
+        ))
+    }
+}
 
 pub async fn negotiate_multiplexing_protocol(
     stream: &mut EncryptedStream,
     is_initiator: bool,
     supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
-) {
+) -> tokio::io::Result<String> {
     if is_initiator {
         println!("[negotiate_protocol] -> Sending /multistream/1.0.0");
         let _ = stream.send(b"/multistream/1.0.0\n").await;
@@ -30,8 +107,13 @@ pub async fn negotiate_multiplexing_protocol(
             .unwrap()
         {
             println!("[negotiate_protocol] ✅ Agreed on protocol: {transport}");
+            return Ok(transport);
         } else {
             eprintln!("[negotiate_protocol] ❌ Unimplemented protocol");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported negotiation protocol: {}", proto),
+            ));
         }
     } else {
         eprintln!(

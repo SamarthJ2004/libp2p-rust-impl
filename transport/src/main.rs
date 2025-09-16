@@ -1,4 +1,4 @@
-use common::EncryptedStream;
+use common::{EncryptedStream, ping_client, ping_server};
 use muxer::negotiate_multiplexing_protocol;
 use negotiation::negotiate_protocol;
 use security::negotiate_security_protocol;
@@ -77,56 +77,27 @@ async fn run_client(addr: &str) {
     };
 
     println!("[client] Starting multiplexing protocol negotiation...");
-    negotiate_multiplexing_protocol(&mut stream, true, &supported_protocols()).await;
+    let mux_protocol = negotiate_multiplexing_protocol(&mut stream, true, &supported_protocols())
+        .await
+        .unwrap();
     println!("[client] Protocol negotiation complete");
 
-    println!("[client] Starting protocol negotiation...");
-    negotiate_protocol(&mut stream, true, &supported_protocols()).await;
-    println!("[client] Protocol negotiation complete");
-
-    let arc_stream = Arc::new(stream);
-    let stream_clone = Arc::clone(&arc_stream);
-
-    // task: read from the socket
-    let socket_task = tokio::spawn(async move {
-        loop {
-            let response = arc_stream.recv().await.unwrap();
-            match response.len() {
-                0 => {
-                    println!("[client] Server closed connection");
-                    break;
-                }
-                _ => {
-                    println!("[client] <- {}", String::from_utf8_lossy(&response).trim());
-                }
+    println!("[client] Starting protocol negotiation with {addr}");
+    match mux_protocol.as_str() {
+        "/mplex" => match negotiate_protocol(&mut stream, true, &supported_protocols()).await {
+            Ok(protocol) => {
+                println!("[client] Protocol negotiation complete with {addr}");
+                ping_client(stream).await;
             }
+            Err(_) => {
+                std::process::exit(1);
+            }
+        },
+        _ => {
+            eprintln!("[client] no matching protocol found");
+            std::process::exit(1);
         }
-    });
-
-    // task: read from stdin and send to socket
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin_reader = BufReader::new(io::stdin());
-        let mut input = String::new();
-
-        loop {
-            input.clear();
-            let n = stdin_reader.read_line(&mut input).await.unwrap();
-            if n == 0 {
-                println!("[client] stdin closed");
-                break;
-            }
-
-            input = input.trim().to_string();
-            let msg = format!("PING {input}");
-            println!("[client] -> Sending: {msg}");
-            if let Err(e) = stream_clone.send(format!("{msg}\n").as_bytes()).await {
-                eprintln!("[client] Error writing to server: {e}");
-                break;
-            }
-        }
-    });
-
-    let _ = tokio::join!(socket_task, stdin_task);
+    }
 }
 
 async fn handle_connection(socket: TcpStream, addr: SocketAddr) {
@@ -153,36 +124,25 @@ async fn handle_connection(socket: TcpStream, addr: SocketAddr) {
     };
 
     println!("[server] Starting multiplexing protocol negotiation...");
-    negotiate_multiplexing_protocol(&mut stream, false, &supported_protocols()).await;
+    let mux_protocol = negotiate_multiplexing_protocol(&mut stream, false, &supported_protocols())
+        .await
+        .unwrap();
     println!("[server] Protocol negotiation complete");
 
     println!("[server] Starting protocol negotiation with {addr}");
-    negotiate_protocol(&mut stream, false, &supported_protocols()).await;
-    println!("[server] Protocol negotiation complete with {addr}");
-
-    loop {
-        let response = stream.recv().await.unwrap();
-        match response.len() {
-            0 => {
-                println!("[server] Client {addr} closed connection");
-                break;
+    match mux_protocol.as_str() {
+        "/mplex" => match negotiate_protocol(&mut stream, false, &supported_protocols()).await {
+            Ok(protocol) => {
+                println!("[server] Protocol negotiation complete with {addr}");
+                ping_server(&mut stream, addr).await;
             }
-            _ => {
-                println!("[server] <- {}", String::from_utf8_lossy(&response).trim());
+            Err(_) => {
+                std::process::exit(1);
             }
-        }
-
-        let line = String::from_utf8_lossy(&response);
-        let msg = line.trim();
-        println!("[server] Received from {addr}: {msg}");
-
-        if msg.starts_with("PING") {
-            let reply = msg.replace("PING", "PONG");
-            println!("[server] -> Sending: {reply}");
-            if let Err(e) = stream.send(format!("{reply}\n").as_bytes()).await {
-                eprintln!("[server] Error writing to {addr}: {e}");
-                break;
-            }
+        },
+        _ => {
+            eprintln!("[server] no matching protocol found");
+            std::process::exit(1);
         }
     }
 }

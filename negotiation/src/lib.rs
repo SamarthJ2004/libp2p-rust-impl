@@ -6,7 +6,7 @@ pub async fn negotiate_protocol(
     stream: &mut EncryptedStream,
     is_initiator: bool,
     supported_protocols: &HashMap<&'static str, Vec<&'static str>>,
-) {
+) -> tokio::io::Result<String> {
     if is_initiator {
         println!("[negotiate_protocol] -> Sending /multistream/1.0.0");
         let _ = stream.send(b"/multistream/1.0.0\n").await;
@@ -30,11 +30,19 @@ pub async fn negotiate_protocol(
             .unwrap()
         {
             println!("[negotiate_protocol] ✅ Agreed on protocol: {transport}");
+            return Ok(transport);
         } else {
             eprintln!("[negotiate_protocol] ❌ Unimplemented protocol");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported negotiation protocol: {}", proto),
+            ));
         }
     } else {
-        eprintln!("[negotiate_protocol] Unsupported negotiation protocol: {other}", other = proto);
+        eprintln!(
+            "[negotiate_protocol] Unsupported negotiation protocol: {other}",
+            other = proto
+        );
         std::process::exit(1);
     }
 }
